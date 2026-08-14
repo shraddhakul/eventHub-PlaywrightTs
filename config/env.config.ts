@@ -5,9 +5,11 @@ import path from 'path';
  * Loads and provides strongly-typed environment variables based on TEST_ENV.
  * Prevents hardcoded URLs, IDs, or tokens anywhere in the codebase.
  */
+
 const env = process.env.TEST_ENV || 'qa';
 
 // Load environment-specific file first (.env.qa), then fall back to base .env
+// Reads config/.env or config/.env.qa relative to this file
 dotenv.config({ path: path.resolve(__dirname, `.env.${env}`) });
 dotenv.config({ path: path.resolve(__dirname, `.env`) });
 

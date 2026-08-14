@@ -1,91 +1,94 @@
-import { test as base, request as playwrightRequest, Page, APIRequestContext } from '@playwright/test';
-// This import statement brings in Playwright's core test runner alongside its primary TypeScript 
-// interfaces to build custom fixtures and page object structures.
+/**
+ * @file test.fixture.ts
+ * @description Core Playwright Fixture Extension module.
+ */
 
+import { test as base, request as playwrightRequest, Page, APIRequestContext } from '@playwright/test';
 import { LoginPage } from '../pages/login.page';
 import { DashboardPage } from '../pages/dashboard.page';
 import { EventService } from '../api/services/event.service';
 import { Config } from '../../config/env.config';
 
 /**
- * Fixture Types Interface.
- * Injects isolated page object instances and API clients cleanly into tests.
+ * CustomFixtures Interface (Test-Scoped)
+ * -----------------------------------------------------------------------------
+ * Defines fixtures that are instantiated FRESH for EVERY individual test spec.
  */
-/**
- * Interface defining authentication and page fixture types.
- */
-type AuthSession = {
-  token: string;
-  storageState: {
-    cookies: Array<{ name: string; value: string; domain: string; path: string }>;
-    origins: Array<{ origin: string; localStorage: Array<{ name: string; value: string }> }>;
-  };
-};
-
 type CustomFixtures = {
-  /* Authentication Core */
-  authSession: AuthSession;
-  
-  /* API Context Branches */
-  authenticatedRequest: APIRequestContext;
-  rawRequest: APIRequestContext;
-  
-  /* UI Context Branches */
-  authenticatedPage: Page;
+  /** Instantiated Page Object for Login workflows */
   loginPage: LoginPage;
+
+  /** Instantiated Page Object for Dashboard workflows */
   dashboardPage: DashboardPage;
-  
-  /* Services */
+
+  /** Unauthenticated request context (used for negative security tests like 401/403 validation) */
+  rawRequest: APIRequestContext;
+
+  /** Pre-configured request context with 'Authorization: Bearer <token>' attached */
+  authenticatedRequest: APIRequestContext;
+
+  /** Pre-authenticated Browser Page (Bypasses UI login by injecting auth token) */
+  authenticatedPage: Page;
+
+  /** High-level API Service wrapper injecting the authenticated request context */
   eventService: EventService;
 };
 
-export const test = base.extend<CustomFixtures>({
-  /**
-   * Worker/Test-level Auth Session Fixture
-   * Authenticates once via API to obtain both token and UI storageState.
-   */
-  authSession: async ({}, use) => {
-    const apiContext = await playwrightRequest.newContext({
-      baseURL: Config.apiBaseUrl,
-    });
+/**
+ * WorkerFixtures Interface (Worker-Scoped)
+ * -----------------------------------------------------------------------------
+ * Defines state shared across ALL tests running within the SAME worker thread/process.
+ */
+type WorkerFixtures = {
+  /** Cached Bearer token generated once per parallel worker process */
+  workerAuthToken: string;
+};
 
-    const response = await apiContext.post('/auth/login', {
-      data: {
-        email: Config.adminUser,
-        password: Config.adminPass,
-      },
-    });
+/**
+ * Base Test Extension
+ * -----------------------------------------------------------------------------
+ * Extends Playwright's native `test` runner with our custom typed fixtures.
+ */
+export const test = base.extend<CustomFixtures, WorkerFixtures>({
 
-    if (!response.ok()) {
-      throw new Error(`Failed to authenticate fixture user: ${response.statusText()}`);
-    }
+  // ===========================================================================
+  // 1. WORKER-SCOPED FIXTURES
+  // ===========================================================================
 
-    const body = await response.json();
-    const token = body.token || body.accessToken;
+  workerAuthToken: [
+    async ({ playwright }, use) => {
+      const tempApiContext = await playwright.request.newContext({
+        baseURL: Config.apiBaseUrl,
+      });
 
-    const storageState = {
-      cookies: [],
-      origins: [
-        {
-          origin: Config.baseUrl,
-          localStorage: [{ name: 'authToken', value: token }],
+      const response = await tempApiContext.post('/auth/login', {
+        data: {
+          username: process.env.API_USERNAME,
+          password: process.env.API_PASSWORD,
         },
-      ],
-    };
+      });
 
-    await use({ token, storageState });
-    await apiContext.dispose();
+      const { token } = await response.json();
+      await tempApiContext.dispose();
+
+      await use(token);
+    },
+    { scope: 'worker' },
+  ],
+
+  // ===========================================================================
+  // 2. TEST-SCOPED API FIXTURES
+  // ===========================================================================
+
+  rawRequest: async ({ request }, use) => {
+    await use(request);
   },
 
-  /**
-   * Authenticated API Request Context
-   * Pre-loads the Authorization Bearer header into every outbound request.
-   */
-  authenticatedRequest: async ({ authSession }, use) => {
+  authenticatedRequest: async ({ workerAuthToken }, use) => {
     const authContext = await playwrightRequest.newContext({
       baseURL: Config.apiBaseUrl,
       extraHTTPHeaders: {
-        Authorization: `Bearer ${authSession.token}`,
+        Authorization: `Bearer ${workerAuthToken}`,
         'Content-Type': 'application/json',
       },
     });
@@ -94,41 +97,42 @@ export const test = base.extend<CustomFixtures>({
     await authContext.dispose();
   },
 
-  /**
-   * Raw (Unauthenticated) Request Context
-   * Re-exports Playwright's default request fixture for negative testing.
-   */
-  rawRequest: async ({ request }, use) => {
-    await use(request);
-  },
+  // ===========================================================================
+  // 3. AUTHENTICATED UI PAGE FIXTURE
+  // ===========================================================================
 
   /**
-   * Authenticated UI Page Context
-   * Spawns an isolated browser context pre-loaded with the auth storageState.
+   * Pre-authenticates the browser `page` instance using the worker token.
+   * Injects the token into window.localStorage prior to navigation so UI
+   * routes like `/dashboard` load in an authenticated state immediately.
    */
-  authenticatedPage: async ({ browser, authSession }, use) => {
-    const context = await browser.newContext({
-      storageState: authSession.storageState,
-    });
-    const page = await context.newPage();
+  authenticatedPage: async ({ page, workerAuthToken }, use) => {
+    // Inject the authentication token into browser local storage before page scripts execute
+    await page.addInitScript((token) => {
+      window.localStorage.setItem('token', token); // Adjust 'token' key if your frontend uses e.g. 'authToken' or 'jwt'
+    }, workerAuthToken);
 
     await use(page);
-
-    await page.close();
-    await context.close();
   },
 
-  /* Service & Page Objects Injection */
-  eventService: async ({ authenticatedRequest }: { authenticatedRequest: APIRequestContext }, use) => {
-    await use(new EventService(authenticatedRequest));
-  },
-
-  dashboardPage: async ({ authenticatedPage }, use) => {
-    await use(new DashboardPage(authenticatedPage));
-  },
+  // ===========================================================================
+  // 4. PAGE OBJECT FIXTURES
+  // ===========================================================================
 
   loginPage: async ({ page }, use) => {
     await use(new LoginPage(page));
+  },
+
+  dashboardPage: async ({ page }, use) => {
+    await use(new DashboardPage(page));
+  },
+
+  // ===========================================================================
+  // 5. API SERVICE FIXTURES
+  // ===========================================================================
+
+  eventService: async ({ authenticatedRequest }, use) => {
+    await use(new EventService(authenticatedRequest));
   },
 });
 
